@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace Shel\ApiConnector\Service;
@@ -15,6 +16,7 @@ use Neos\Flow\Http\Client\Browser;
 use Neos\Flow\Http\Client\CurlEngine;
 use Neos\Flow\Http\Client\InfiniteRedirectionException;
 use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\UriInterface;
 use Shel\ApiConnector\Log\ApiConnectorLoggerInterface;
 
 /**
@@ -35,10 +37,7 @@ use Shel\ApiConnector\Log\ApiConnectorLoggerInterface;
  */
 abstract class AbstractApiConnector
 {
-    /**
-     * @var array
-     */
-    protected $requestEngineOptions = [];
+    protected array $requestEngineOptions = [];
 
     /**
      * This should be overriden for the implementation.
@@ -60,10 +59,7 @@ abstract class AbstractApiConnector
      */
     protected $fallbackApiCache;
 
-    /**
-     * @var array
-     */
-    protected $objectCache = [];
+    protected array $objectCache = [];
 
     /**
      * @Flow\Inject
@@ -73,33 +69,50 @@ abstract class AbstractApiConnector
 
     /**
      * Retrieves data from the api.
- *
-     * @throws CacheException
      */
-    public function fetchData(string $actionName, array $additionalParameters = []): array
+    public function fetchData(string $actionName, array $additionalParameters = []): ?string
     {
         $requestUri = $this->buildRequestUri($actionName, $additionalParameters);
-        $fallbackCacheKey = $this->getCacheKey((string)$requestUri);
-        $response = false;
+        $useCache = $this->apiSettings['useFallbackCache'];
+        $cacheKey = $this->getCacheKey((string)$requestUri);
+        $responseText = null;
 
-        if ($this->apiSettings['useFallbackCache']) {
-            $response = $this->fallbackApiCache->get($fallbackCacheKey);
+        if ($useCache) {
+            $responseText = $this->fallbackApiCache->get($cacheKey);
         }
 
-        if ($response === false) {
-            // Without a fallback cache wait for data retrieval
-            $response = $this->fetchDataInternal((string)$requestUri);
+        if (is_string($responseText)) {
+            $this->logger->info(sprintf('Using fallback cache for action "%s"', $actionName));
+            return $responseText;
         }
 
-        return $response !== false ? json_decode($response, true) : [];
+        // Get new data if cache is empty or invalid
+        $response = $this->fetchDataInternal($requestUri);
+
+        if ($response instanceof ResponseInterface) {
+            $responseText = $response->getBody()->getContents();
+
+            if ($useCache) {
+                try {
+                    $this->logger->info(sprintf('Updated fallback cache for action "%s"', $actionName));
+                    $this->fallbackApiCache->set($cacheKey, $responseText);
+                } catch (CacheException $e) {
+                    $this->logger->error('Could not set fallback cache', [$e->getMessage()]);
+                }
+            }
+
+            return $responseText;
+        }
+
+        return null;
     }
 
     protected function buildRequestUri(string $actionName, array $additionalParameters = []): Uri
     {
         $requestUri = new Uri($this->apiSettings['apiUrl']);
-        $requestUri = $requestUri->withPath($requestUri->getPath() . $this->apiSettings['actions'][$actionName])
+        return $requestUri
+            ->withPath($requestUri->getPath() . $this->apiSettings['actions'][$actionName])
             ->withQuery(http_build_query(array_merge($this->apiSettings['parameters'], $additionalParameters)));
-        return $requestUri;
     }
 
     /**
@@ -110,30 +123,18 @@ abstract class AbstractApiConnector
         return sha1(self::class . '__' . $identifier);
     }
 
-    /**
-     * @return bool|ResponseInterface
-     */
-    protected function fetchDataInternal(string $requestUri)
+    protected function fetchDataInternal(UriInterface $requestUri): bool|ResponseInterface
     {
         $browser = $this->getBrowser();
         try {
             $response = $browser->request($requestUri, 'GET');
         } catch (\Exception $e) {
-            $this->logger->error('Get request to Api failed with exception', [$e]);
+            $this->logger->error('Get request to Api failed with exception', [$e->getMessage()]);
             $response = false;
         }
 
         if ($response !== false && $response->getStatusCode() !== 200) {
             $this->logger->error('Get request to Api failed with code', [$response->getStatusCode()]);
-        }
-
-        // Store new data in fallback cache if it's valid
-        if ($this->apiSettings['useFallbackCache'] && $response !== false) {
-            try {
-                $this->fallbackApiCache->set($this->getCacheKey($requestUri), $response);
-            } catch (CacheException $e) {
-                $this->logger->error('Cache error', [$e]);
-            }
         }
 
         return $response;
@@ -188,10 +189,7 @@ abstract class AbstractApiConnector
         return true;
     }
 
-    /**
-     * @return mixed
-     */
-    protected function getItem(string $cacheKey)
+    protected function getItem(string $cacheKey): mixed
     {
         if (array_key_exists($cacheKey, $this->objectCache)) {
             return $this->objectCache[$cacheKey];
@@ -203,10 +201,9 @@ abstract class AbstractApiConnector
     }
 
     /**
-     * @param mixed $value
      * @throws CacheException
      */
-    protected function setItem(string $cacheKey, $value, array $tags = []): void
+    protected function setItem(string $cacheKey, mixed $value, array $tags = []): void
     {
         $this->objectCache[$cacheKey] = $value;
         $this->apiCache->set($cacheKey, $value, $tags);
